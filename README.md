@@ -19,6 +19,27 @@ What changed:
 
 Folder sizes count file contents only, not the folders' own NTFS index blocks.
 
+### Fast scan of whole NTFS drives (Windows, administrator)
+
+When a whole NTFS drive such as `C:\` is scanned as administrator, spaceman reads the drive's
+Master File Table directly instead of walking folders, the way WizTree does. Without admin rights
+the window shows a **Fast scan (admin)** button that restarts it elevated.
+
+| Whole drive, administrator | folder walk | MFT scan |
+|---|---|---|
+| C: (2 TB NVMe, BitLocker, 4.8M files) | 15-33 s | 5.3 s |
+| D: (512 GB NVMe, 0.7M files) | 9.4 s | 4.0 s |
+
+- 4 reader threads read the MFT in 4 MB chunks and skip unused record ranges using the MFT bitmap.
+  One builder thread inserts each record as soon as its parent folder is known, so boxes still pop
+  in and grow while the MFT is read.
+- Handles fragmented MFTs, including attribute lists stored outside record 0, and large files
+  whose size lives in an extension record.
+- Hard-linked files (common in `C:\Windows`) are counted once, at one of their paths, so totals
+  match the real disk usage and are a little lower than the folder walk.
+- NTFS system files (`$MFT`, `$LogFile`, ...) show up in the root. Alternate data streams are
+  not counted.
+
 ---
 
 ## Original README

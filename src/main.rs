@@ -2,6 +2,8 @@
 #![windows_subsystem = "windows"]
 mod actions;
 mod config;
+#[cfg(windows)]
+mod mft;
 //mod mounts;
 mod node_color;
 mod scan;

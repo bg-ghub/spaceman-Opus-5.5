@@ -85,11 +85,22 @@ fn layout_node(
         }
     }
     if rest > 0 {
-        items.push(Item { node: None, size: rest });
+        items.push(Item {
+            node: None,
+            size: rest,
+        });
     }
     // sort once, splitting a sorted slice keeps both halves sorted
     items.sort_unstable_by_key(|item| item.size);
-    layout_group(tree, &items, total_size, bound, dir_level + 1, text_offset, gui_nodes);
+    layout_group(
+        tree,
+        &items,
+        total_size,
+        bound,
+        dir_level + 1,
+        text_offset,
+        gui_nodes,
+    );
 }
 
 fn layout_group(
@@ -156,7 +167,15 @@ fn layout_group(
         )
     };
 
-    layout_group(tree, group_a, size_a, bound_a, dir_level, text_offset, gui_nodes);
+    layout_group(
+        tree,
+        group_a,
+        size_a,
+        bound_a,
+        dir_level,
+        text_offset,
+        gui_nodes,
+    );
     layout_group(
         tree,
         group_b,

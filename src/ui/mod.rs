@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::scan::Scan;
+use crate::scan::{Scan, ScanMethod};
 use crate::squarify::compute_gui_nodes;
 use crate::types::{GUINode, NodeID, Rectangle};
 use crate::{actions, config};
@@ -35,6 +35,7 @@ pub enum TreeMapMessage {
     ConfirmTrashNode,
     CancelTrashNode,
     EscPressed,
+    RelaunchAsAdmin,
 }
 
 // storing nothing for now
@@ -244,7 +245,12 @@ impl TreeMapApp {
     }
 
     fn title(&self) -> String {
-        String::from(config::APP_TITLE)
+        match &self.scan {
+            Some(scan) if scan.method == ScanMethod::Mft => {
+                format!("{} - fast scan (MFT)", config::APP_TITLE)
+            }
+            _ => String::from(config::APP_TITLE),
+        }
     }
 
     fn update(&mut self, message: TreeMapMessage) -> Task<TreeMapMessage> {
@@ -396,6 +402,14 @@ impl TreeMapApp {
                     }
                 }
             }
+            TreeMapMessage::RelaunchAsAdmin => {
+                #[cfg(windows)]
+                if let Some(scan) = &self.scan
+                    && crate::mft::relaunch_as_admin(&scan.path)
+                {
+                    std::process::exit(0);
+                }
+            }
             TreeMapMessage::EscPressed => {
                 if self.node_pending_trash.is_some() {
                     return Task::done(TreeMapMessage::CancelTrashNode);
@@ -439,6 +453,25 @@ impl TreeMapApp {
                 .into()
         };
 
+        // the MFT scan needs administrator rights, offer a restart when that is all it lacks
+        let admin_button: Element<'_, TreeMapMessage> =
+            if self.scan.as_ref().is_some_and(|scan| scan.mft_needs_admin) {
+                tooltip(
+                    button("Fast scan (admin)")
+                        .style(button_style)
+                        .on_press(TreeMapMessage::RelaunchAsAdmin),
+                    container(text(
+                        "Restart as administrator and read the drive's file table directly",
+                    ))
+                    .padding(5.0)
+                    .style(container::rounded_box),
+                    tooltip::Position::Bottom,
+                )
+                .into()
+            } else {
+                text("").into()
+            };
+
         let header = column![
             container(
                 row![
@@ -457,6 +490,7 @@ impl TreeMapApp {
                         .font(iced::Font::DEFAULT.weight(iced::font::Weight::Bold))
                         .align_y(iced::Alignment::Center)
                     ),
+                    admin_button,
                     button("Refresh")
                         .style(button_style)
                         .on_press(TreeMapMessage::ScanRestarted),

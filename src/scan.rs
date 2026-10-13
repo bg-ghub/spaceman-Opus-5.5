@@ -12,9 +12,52 @@ use std::time::{Duration, Instant};
 
 // results are collected outside the tree lock and applied in one short
 // critical section per window, so the UI never waits on the scan for long
-const BATCH_WINDOW: Duration = Duration::from_millis(15);
+pub const BATCH_WINDOW: Duration = Duration::from_millis(15);
 const MAX_WORKERS: usize = 16;
 const NO_TOP: u32 = u32::MAX;
+
+// the state shared between a Scan, its background threads and the UI
+#[derive(Debug, Clone)]
+pub struct ScanShared {
+    pub tree: Arc<Mutex<Tree>>,
+    pub update_signal: Arc<AtomicBool>,
+    pub complete: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    progress_bits: Arc<AtomicU64>,
+}
+
+impl ScanShared {
+    fn new(directory: &str) -> Self {
+        ScanShared {
+            tree: Arc::new(Mutex::new(Tree::new(directory))),
+            update_signal: Arc::new(AtomicBool::new(true)),
+            complete: Arc::new(AtomicBool::new(false)),
+            terminate: Arc::new(AtomicBool::new(false)),
+            progress_bits: Arc::new(AtomicU64::new(0f64.to_bits())),
+        }
+    }
+    pub fn terminated(&self) -> bool {
+        self.terminate.load(Ordering::SeqCst)
+    }
+    pub fn set_progress(&self, fraction: f64) {
+        self.progress_bits
+            .store(fraction.to_bits(), Ordering::Relaxed);
+    }
+    // marks the scan complete and lets every background thread exit
+    pub fn finish(&self) {
+        self.complete.store(true, Ordering::SeqCst);
+        self.update_signal.store(true, Ordering::SeqCst);
+        self.terminate.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScanMethod {
+    // reads the NTFS Master File Table of a whole volume
+    Mft,
+    // walks the directories
+    Walk,
+}
 
 #[derive(Debug)]
 pub struct Scan {
@@ -22,68 +65,55 @@ pub struct Scan {
     pub tree_mutex: Arc<Mutex<Tree>>,
     pub complete: Arc<AtomicBool>,
     pub update_signal: Arc<AtomicBool>,
-    terminate_signal: Arc<AtomicBool>,
+    pub method: ScanMethod,
+    // the MFT scan would work for this path if the app ran as administrator
+    pub mft_needs_admin: bool,
+    shared: ScanShared,
     queue: Arc<JobQueue>,
-    progress_bits: Arc<AtomicU64>,
 }
 
 impl Scan {
     pub fn new(directory: &str) -> Self {
-        let path = directory.to_string();
-        let tree_mutex = Arc::new(Mutex::new(Tree::new(directory)));
-        let terminate_signal = Arc::new(AtomicBool::new(false));
-        let update_signal = Arc::new(AtomicBool::new(true));
-        let complete = Arc::new(AtomicBool::new(false));
-        let progress_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+        Self::with_mft(directory, true)
+    }
+    pub fn with_mft(directory: &str, allow_mft: bool) -> Self {
+        let shared = ScanShared::new(directory);
         let queue = Arc::new(JobQueue::default());
-        let root_device = fs::metadata(directory).ok().and_then(|m| device_of(&m));
+        let mut method = ScanMethod::Walk;
+        let mut mft_needs_admin = false;
 
-        let (tx, rx) = mpsc::channel();
-        let workers = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(2, MAX_WORKERS);
-        for _ in 0..workers {
-            let queue = queue.clone();
-            let tx: Sender<Listing> = tx.clone();
-            let terminate = terminate_signal.clone();
-            thread::spawn(move || worker(queue, tx, terminate, root_device));
+        #[cfg(windows)]
+        if allow_mft {
+            match crate::mft::start(directory, shared.clone()) {
+                Ok(()) => method = ScanMethod::Mft,
+                Err(crate::mft::MftUnavailable::AccessDenied) => mft_needs_admin = true,
+                Err(crate::mft::MftUnavailable::NotVolumeRoot) => {}
+                Err(e) => println!("MFT scan unavailable, walking directories: {e}"),
+            }
         }
-        drop(tx);
+        #[cfg(not(windows))]
+        let _ = allow_mft;
 
-        queue.push_all(vec![Job {
-            node: 0,
-            path: PathBuf::from(directory),
-            top: NO_TOP,
-        }]);
-
-        let consumer = Consumer {
-            tree: tree_mutex.clone(),
-            rx,
-            queue: queue.clone(),
-            update_signal: update_signal.clone(),
-            terminate: terminate_signal.clone(),
-            complete: complete.clone(),
-            progress_bits: progress_bits.clone(),
-            workers,
-        };
-        thread::spawn(move || consumer.run());
+        if method == ScanMethod::Walk {
+            start_walk(directory, shared.clone(), queue.clone());
+        }
 
         Scan {
-            path,
-            tree_mutex,
-            complete,
-            update_signal,
-            terminate_signal,
+            path: directory.to_string(),
+            tree_mutex: shared.tree.clone(),
+            complete: shared.complete.clone(),
+            update_signal: shared.update_signal.clone(),
+            method,
+            mft_needs_admin,
+            shared,
             queue,
-            progress_bits,
         }
     }
     pub fn progress(&self) -> f64 {
         if self.complete.load(Ordering::SeqCst) {
             1.0
         } else {
-            f64::from_bits(self.progress_bits.load(Ordering::Relaxed)) * 0.99
+            f64::from_bits(self.shared.progress_bits.load(Ordering::Relaxed)) * 0.99
         }
     }
 }
@@ -91,13 +121,42 @@ impl Scan {
 impl Drop for Scan {
     fn drop(&mut self) {
         // this will signal to the scan threads to exit after the Scan struct is out of scope
-        self.complete.store(true, Ordering::SeqCst);
-        self.terminate_signal.store(true, Ordering::SeqCst);
+        self.shared.finish();
         self.queue.wake_all();
-        // the consumer checks the terminate signal while holding this lock,
-        // so it never applies a batch to the cleared tree
+        // the consumers check the terminate signal while holding this lock,
+        // so they never apply a batch to the cleared tree
         self.tree_mutex.lock().unwrap().clear();
     }
+}
+
+fn start_walk(directory: &str, shared: ScanShared, queue: Arc<JobQueue>) {
+    let root_device = fs::metadata(directory).ok().and_then(|m| device_of(&m));
+    let (tx, rx) = mpsc::channel();
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, MAX_WORKERS);
+    for _ in 0..workers {
+        let queue = queue.clone();
+        let tx: Sender<Listing> = tx.clone();
+        let terminate = shared.terminate.clone();
+        thread::spawn(move || worker(queue, tx, terminate, root_device));
+    }
+    drop(tx);
+
+    queue.push_all(vec![Job {
+        node: 0,
+        path: PathBuf::from(directory),
+        top: NO_TOP,
+    }]);
+
+    let consumer = Consumer {
+        shared,
+        rx,
+        queue,
+        workers,
+    };
+    thread::spawn(move || consumer.run());
 }
 
 #[cfg(unix)]
@@ -187,7 +246,14 @@ fn worker(
 ) {
     while let Some(job) = queue.pop(&terminate) {
         let (names, entries) = list_dir(&job.path, root_device);
-        if tx.send(Listing { job, names, entries }).is_err() {
+        if tx
+            .send(Listing {
+                job,
+                names,
+                entries,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -213,9 +279,7 @@ fn list_dir(path: &Path, root_device: Option<u64>) -> (Vec<u8>, Vec<Entry>) {
         // symlinks and junctions are not directories here, so they are never followed
         let kind = if !file_type.is_dir() {
             Kind::File
-        } else if root_device.is_some()
-            && metadata.as_ref().and_then(device_of) != root_device
-        {
+        } else if root_device.is_some() && metadata.as_ref().and_then(device_of) != root_device {
             Kind::ForeignDir
         } else {
             Kind::Dir
@@ -276,13 +340,9 @@ impl TopProgress {
 }
 
 struct Consumer {
-    tree: Arc<Mutex<Tree>>,
+    shared: ScanShared,
     rx: Receiver<Listing>,
     queue: Arc<JobQueue>,
-    update_signal: Arc<AtomicBool>,
-    terminate: Arc<AtomicBool>,
-    complete: Arc<AtomicBool>,
-    progress_bits: Arc<AtomicU64>,
     workers: usize,
 }
 
@@ -293,7 +353,7 @@ impl Consumer {
         let mut batch: Vec<Listing> = Vec::new();
         let mut window_start = Instant::now();
 
-        while pending > 0 && !self.terminate.load(Ordering::SeqCst) {
+        while pending > 0 && !self.shared.terminated() {
             let wait = BATCH_WINDOW.saturating_sub(window_start.elapsed());
             match self.rx.recv_timeout(wait.max(Duration::from_millis(1))) {
                 Ok(listing) => batch.push(listing),
@@ -311,8 +371,8 @@ impl Consumer {
 
             let mut new_jobs = Vec::new();
             {
-                let mut tree = self.tree.lock().unwrap();
-                if self.terminate.load(Ordering::SeqCst) {
+                let mut tree = self.shared.tree.lock().unwrap();
+                if self.shared.terminated() {
                     break;
                 }
                 for listing in batch.drain(..) {
@@ -321,14 +381,11 @@ impl Consumer {
                 }
             }
             self.queue.push_all(new_jobs);
-            self.progress_bits
-                .store(progress.fraction().to_bits(), Ordering::Relaxed);
-            self.update_signal.store(true, Ordering::SeqCst);
+            self.shared.set_progress(progress.fraction());
+            self.shared.update_signal.store(true, Ordering::SeqCst);
             window_start = Instant::now();
         }
-        self.complete.store(true, Ordering::SeqCst);
-        self.update_signal.store(true, Ordering::SeqCst);
-        self.terminate.store(true, Ordering::SeqCst);
+        self.shared.finish();
         self.queue.wake_all();
     }
 }
@@ -393,8 +450,9 @@ mod tests {
     #[ignore]
     fn bench_scan() {
         let path = std::env::var("SPACEMAN_BENCH_PATH").unwrap_or_else(|_| ".".into());
+        let allow_mft = std::env::var_os("SPACEMAN_BENCH_WALK").is_none();
         let start = Instant::now();
-        let scan = Scan::new(&path);
+        let scan = Scan::with_mft(&path, allow_mft);
         while !scan.complete.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_millis(5));
         }
@@ -409,8 +467,18 @@ mod tests {
         let start = Instant::now();
         let gui_nodes = compute_gui_nodes(&tree, 0, bound, 20.0);
         let layout_time = start.elapsed();
+        let mut top: Vec<_> = tree
+            .children(0)
+            .map(|c| (tree.get_elem(c).size, tree.name(c).into_owned()))
+            .collect();
+        top.sort_unstable_by(|a, b| b.cmp(a));
+        for (size, name) in top.iter().take(12) {
+            println!("TOP {size:>16} {name}");
+        }
         println!(
-            "BENCH path={} nodes={} bytes={} scan={:?} layout={:?} boxes={} tree_heap_mb={:.1}",
+            "BENCH method={:?} needs_admin={} path={} nodes={} bytes={} scan={:?} layout={:?} boxes={} tree_heap_mb={:.1}",
+            scan.method,
+            scan.mft_needs_admin,
             path,
             tree.len(),
             tree.get_elem(0).size,
