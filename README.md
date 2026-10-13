@@ -1,4 +1,28 @@
-# spaceman <img src="spaceman.png" width="28"/>
+# spaceman Opus 5.5 <img src="spaceman.png" width="28"/>
+
+A performance fork of [salihgerdan/spaceman](https://github.com/salihgerdan/spaceman).
+The treemap still grows live while scanning, but scans are much faster and use far less memory.
+
+| Windows, warm cache | upstream v0.2.1 | this fork |
+|---|---|---|
+| `C:\Program Files` (266k items) | 22.3 s, 143 MB | 0.48 s, 24 MB |
+| `C:\Windows` (411k items) | 37.4 s, 307 MB | 4.4 s, 64 MB |
+| Layout of a 1920x1080 view | 10.4 ms | 0.8 ms |
+
+What changed:
+- Own breadth-first parallel scanner instead of jwalk. On Windows the file size comes from the
+  directory listing, so there is no extra metadata call per file.
+- Scan results are applied to the tree in one short locked batch every 15 ms, so the UI and the
+  scanner barely wait on each other.
+- 32-byte tree nodes: names in one arena, paths rebuilt on demand, children as a sibling list.
+- The layout skips everything too small to draw, and hover highlighting has its own layer.
+
+Folder sizes count file contents only, not the folders' own NTFS index blocks.
+
+---
+
+## Original README
+
 [![Downloads](https://img.shields.io/github/downloads/salihgerdan/spaceman/total)](https://github.com/salihgerdan/spaceman/releases)
 [![Downloads (Latest)](https://img.shields.io/github/downloads/salihgerdan/spaceman/latest/total)](https://github.com/salihgerdan/spaceman/releases/latest)
 
@@ -6,7 +30,7 @@ Treemap disk usage analyzer: *In search of lost space* (a.k.a. wata-analyzer)
 ![Screenshot](screenshot.png?raw=true)
 
 ## Features
-- [x] Uses the jwalk library as the renowned [dua-cli](https://github.com/Byron/dua-cli/) does, enabling multi-threaded fast scans
+- [x] Multi-threaded fast scans (upstream uses the jwalk library, this fork its own scanner)
 - [x] Linux-first, cross-platform
 - [x] Live display of scan results, responsive UI
 - [x] Zoom into sub-directories
