@@ -1,15 +1,20 @@
-use crate::{
-    config,
-    types::{Node, Tree},
-};
-use jwalk::WalkDirGeneric;
+use crate::types::{NodeID, Tree};
+use std::collections::VecDeque;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+// results are collected outside the tree lock and applied in one short
+// critical section per window, so the UI never waits on the scan for long
+const BATCH_WINDOW: Duration = Duration::from_millis(15);
+const MAX_WORKERS: usize = 16;
+const NO_TOP: u32 = u32::MAX;
 
 #[derive(Debug)]
 pub struct Scan {
@@ -18,219 +23,466 @@ pub struct Scan {
     pub complete: Arc<AtomicBool>,
     pub update_signal: Arc<AtomicBool>,
     terminate_signal: Arc<AtomicBool>,
-    progress_count: usize,
+    queue: Arc<JobQueue>,
+    progress_bits: Arc<AtomicU64>,
 }
 
 impl Scan {
     pub fn new(directory: &str) -> Self {
         let path = directory.to_string();
         let tree_mutex = Arc::new(Mutex::new(Tree::new(directory)));
-        let tree_mutex_clone = tree_mutex.clone();
         let terminate_signal = Arc::new(AtomicBool::new(false));
-        let terminate_signal_clone = terminate_signal.clone();
         let update_signal = Arc::new(AtomicBool::new(true));
-        let update_signal_clone = update_signal.clone();
         let complete = Arc::new(AtomicBool::new(false));
-        let complete_clone = complete.clone();
-        let progress_count = preliminary_progress_count(directory);
-        thread::spawn(move || {
-            walk_into_tree(
-                tree_mutex_clone,
-                update_signal_clone,
-                terminate_signal_clone,
-                complete_clone,
-            )
-        });
+        let progress_bits = Arc::new(AtomicU64::new(0f64.to_bits()));
+        let queue = Arc::new(JobQueue::default());
+        let root_device = fs::metadata(directory).ok().and_then(|m| device_of(&m));
+
+        let (tx, rx) = mpsc::channel();
+        let workers = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, MAX_WORKERS);
+        for _ in 0..workers {
+            let queue = queue.clone();
+            let tx: Sender<Listing> = tx.clone();
+            let terminate = terminate_signal.clone();
+            thread::spawn(move || worker(queue, tx, terminate, root_device));
+        }
+        drop(tx);
+
+        queue.push_all(vec![Job {
+            node: 0,
+            path: PathBuf::from(directory),
+            top: NO_TOP,
+        }]);
+
+        let consumer = Consumer {
+            tree: tree_mutex.clone(),
+            rx,
+            queue: queue.clone(),
+            update_signal: update_signal.clone(),
+            terminate: terminate_signal.clone(),
+            complete: complete.clone(),
+            progress_bits: progress_bits.clone(),
+            workers,
+        };
+        thread::spawn(move || consumer.run());
+
         Scan {
             path,
             tree_mutex,
             complete,
             update_signal,
             terminate_signal,
-            progress_count,
+            queue,
+            progress_bits,
         }
     }
     pub fn progress(&self) -> f64 {
         if self.complete.load(Ordering::SeqCst) {
             1.0
         } else {
-            (self.tree_mutex.lock().unwrap().get_elem(0).children.len() as f64
-                / self.progress_count as f64)
-                * 0.9
+            f64::from_bits(self.progress_bits.load(Ordering::Relaxed)) * 0.99
         }
     }
 }
 
 impl Drop for Scan {
     fn drop(&mut self) {
-        // this will signal to the scan thread to exit after the Scan struct is out of scope
+        // this will signal to the scan threads to exit after the Scan struct is out of scope
         self.complete.store(true, Ordering::SeqCst);
         self.terminate_signal.store(true, Ordering::SeqCst);
-        let mut tree = self.tree_mutex.lock().unwrap();
-        tree.elems.clear();
-        tree.elems.shrink_to_fit();
+        self.queue.wake_all();
+        // the consumer checks the terminate signal while holding this lock,
+        // so it never applies a batch to the cleared tree
+        self.tree_mutex.lock().unwrap().clear();
     }
 }
 
 #[cfg(unix)]
-fn is_same_device(metadata: &std::fs::Metadata, root_device: &mut Option<u64>) -> bool {
+fn device_of(metadata: &fs::Metadata) -> Option<u64> {
     use std::os::unix::prelude::MetadataExt;
-    match root_device {
-        None => {
-            *root_device = Some(metadata.dev());
-            true
-        }
-        Some(root_device) => metadata.dev() == *root_device,
-    }
+    Some(metadata.dev())
 }
 
 #[cfg(not(unix))]
-fn is_same_device(metadata: &std::fs::Metadata, root_device: &mut Option<u64>) -> bool {
-    true
+fn device_of(_metadata: &fs::Metadata) -> Option<u64> {
+    None
 }
 
-fn preliminary_progress_count(directory: &str) -> usize {
-    let contained = fs::read_dir(directory).expect("Cannot open directory");
-    contained.count()
+#[derive(Debug)]
+struct Job {
+    node: NodeID,
+    path: PathBuf,
+    // index of the top level folder this job belongs to, used for progress
+    top: u32,
 }
 
-/*fn update_tree(tree_mutex: &Arc<Mutex<Tree>>, node_id: &NodeID, update_signal: &Arc<AtomicBool>) {
-    // we cannot keep the tree mutex locked in the recursive loop, so we do some cloning
-    let (path, children) = {
-        let tree = tree_mutex.lock().unwrap();
-        let node = tree.get_elem(*node_id);
-        (node.path.clone(), node.children.clone())
-    };
-    if path.exists() {
-        for child in children {
-            update_tree(tree_mutex, &child, update_signal);
+#[derive(Debug, Default)]
+struct JobQueue {
+    jobs: Mutex<VecDeque<Job>>,
+    available: Condvar,
+}
+
+impl JobQueue {
+    fn push_all(&self, jobs: Vec<Job>) {
+        if jobs.is_empty() {
+            return;
         }
-    } else {
-        {
-            tree_mutex.lock().unwrap().invalidate_elem(*node_id);
-        }
-        update_signal.store(true, Ordering::SeqCst);
+        self.jobs.lock().unwrap().extend(jobs);
+        self.available.notify_all();
     }
-}*/
-
-struct StagedEntry {
-    file_name: String,
-    path: std::path::PathBuf,
-    is_file: bool,
-    file_size: u64,
-    depth: usize,
+    fn pop(&self, terminate: &AtomicBool) -> Option<Job> {
+        let mut jobs = self.jobs.lock().unwrap();
+        loop {
+            if terminate.load(Ordering::SeqCst) {
+                return None;
+            }
+            // breadth first, so every visible folder keeps growing while scanning
+            if let Some(job) = jobs.pop_front() {
+                return Some(job);
+            }
+            jobs = self
+                .available
+                .wait_timeout(jobs, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+    }
+    fn len(&self) -> usize {
+        self.jobs.lock().unwrap().len()
+    }
+    fn wake_all(&self) {
+        self.available.notify_all();
+    }
 }
 
-fn walk_into_tree(
-    tree: Arc<Mutex<Tree>>,
-    update_signal: Arc<AtomicBool>,
-    terminate_signal: Arc<AtomicBool>,
-    complete: Arc<AtomicBool>,
-) {
-    let root_name = { tree.lock().unwrap().get_elem(0).name.clone() };
-    // the root device is uninitialized, it only gets initialized when found None
-    // in the is_same_device function
-    let mut root_device = None;
-    let walkdir =
-        WalkDirGeneric::<(Node, Option<Result<std::fs::Metadata, jwalk::Error>>)>::new(root_name)
-            .follow_links(false)
-            .skip_hidden(false)
-            .process_read_dir(move |_depth, _path, _read_dir_state, children| {
-                children.iter_mut().for_each(move |dir_entry_result| {
-                    if let Ok(dir_entry) = dir_entry_result {
-                        if dir_entry.file_type.is_dir() {
-                            let same_device = dir_entry
-                                .metadata()
-                                .as_ref()
-                                .map(|m| is_same_device(m, &mut root_device))
-                                .unwrap_or(true);
-                            if !same_device {
-                                dir_entry.read_children_path = None;
-                            }
-                        }
-                    }
-                })
-            });
-    let mut last_depth = 0;
-    let mut last_node = 0;
-    let mut iter = walkdir.into_iter().peekable();
-    let mut staging_buffer = Vec::with_capacity(1000);
-    let mut last_update = Instant::now();
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    File,
+    Dir,
+    // a directory on another device, shown but not entered
+    ForeignDir,
+}
 
-    while let Some(entry) = iter.next() {
-        if terminate_signal.load(Ordering::SeqCst) {
+struct Entry {
+    name_len: u16,
+    kind: Kind,
+    size: u64,
+}
+
+struct Listing {
+    job: Job,
+    // OsStr encoded bytes of all entry names, back to back
+    names: Vec<u8>,
+    entries: Vec<Entry>,
+}
+
+fn worker(
+    queue: Arc<JobQueue>,
+    tx: Sender<Listing>,
+    terminate: Arc<AtomicBool>,
+    root_device: Option<u64>,
+) {
+    while let Some(job) = queue.pop(&terminate) {
+        let (names, entries) = list_dir(&job.path, root_device);
+        if tx.send(Listing { job, names, entries }).is_err() {
             break;
         }
+    }
+}
 
-        match entry {
-            Ok(e) => {
-                let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                let file_name = e.file_name.clone().into_string().unwrap_or_default();
-                let path = e.path();
-                let is_file = e.file_type.is_file();
-                staging_buffer.push(StagedEntry {
-                    file_name,
-                    path,
-                    is_file,
-                    file_size,
-                    depth: e.depth,
-                });
-            }
-            Err(e) => {
-                println!("Can't read: {}", e);
-            }
+fn list_dir(path: &Path, root_device: Option<u64>) -> (Vec<u8>, Vec<Entry>) {
+    let mut names = Vec::new();
+    let mut entries = Vec::new();
+    let read_dir = match fs::read_dir(path) {
+        Ok(read_dir) => read_dir,
+        Err(e) => {
+            println!("Can't read {}: {}", path.display(), e);
+            return (names, entries);
         }
+    };
+    for dir_entry in read_dir.flatten() {
+        let Ok(file_type) = dir_entry.file_type() else {
+            continue;
+        };
+        // on Windows this comes from the directory listing itself, no extra syscall
+        let metadata = dir_entry.metadata().ok();
+        let size = metadata.as_ref().map_or(0, |m| m.len());
+        // symlinks and junctions are not directories here, so they are never followed
+        let kind = if !file_type.is_dir() {
+            Kind::File
+        } else if root_device.is_some()
+            && metadata.as_ref().and_then(device_of) != root_device
+        {
+            Kind::ForeignDir
+        } else {
+            Kind::Dir
+        };
+        let file_name = dir_entry.file_name();
+        let bytes = file_name.as_encoded_bytes();
+        let name_len = if bytes.len() <= u16::MAX as usize {
+            names.extend_from_slice(bytes);
+            bytes.len() as u16
+        } else {
+            0
+        };
+        entries.push(Entry {
+            name_len,
+            kind,
+            size,
+        });
+    }
+    (names, entries)
+}
 
-        // with time based updates, we might end up missing small folders or the last few elements
-        // check for iter.peek().is_none() or just run this at the end of the loop again
-        if last_update.elapsed() >= config::UPDATE_PERIOD || iter.peek().is_none() {
-            // acquire lock here
-            let mut tree = tree.lock().unwrap();
-            for e in staging_buffer.drain(..) {
-                if e.depth > last_depth {
-                    tree.add_elem(last_node, e.file_name, e.path, e.is_file, e.file_size);
-                } else if e.depth == last_depth {
-                    if let Some(parent) = tree.get_elem(last_node).parent {
-                        tree.add_elem(parent, e.file_name, e.path, e.is_file, e.file_size);
-                    }
-                } else {
-                    let mut parent = last_node;
-                    for _ in e.depth..=last_depth {
-                        parent = tree.get_elem(parent).parent.unwrap_or(parent);
-                    }
-                    tree.add_elem(parent, e.file_name, e.path, e.is_file, e.file_size);
-                }
-                last_depth = e.depth;
-                last_node = tree.last_id;
-            }
-            last_update = Instant::now();
-            update_signal.store(true, Ordering::SeqCst);
+// counts finished top level entries; a folder is finished when no job of its
+// subtree is outstanding anymore
+#[derive(Default)]
+struct TopProgress {
+    pending: Vec<u32>,
+    total: usize,
+    done: usize,
+}
+
+impl TopProgress {
+    fn add_finished(&mut self) {
+        self.total += 1;
+        self.done += 1;
+    }
+    fn add_folder(&mut self) -> u32 {
+        self.total += 1;
+        self.pending.push(1);
+        (self.pending.len() - 1) as u32
+    }
+    fn job_added(&mut self, top: u32) {
+        self.pending[top as usize] += 1;
+    }
+    fn job_finished(&mut self, top: u32) {
+        let pending = &mut self.pending[top as usize];
+        *pending -= 1;
+        if *pending == 0 {
+            self.done += 1;
         }
     }
-    update_signal.store(true, Ordering::SeqCst);
-    complete.store(true, Ordering::SeqCst);
+    fn fraction(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.done as f64 / self.total as f64
+        }
+    }
+}
 
-    /*while terminate_signal.load(Ordering::SeqCst) == false {
-        update_tree(&tree, &0, &update_signal);
-        thread::sleep(Duration::from_millis(4000));
-    }*/
+struct Consumer {
+    tree: Arc<Mutex<Tree>>,
+    rx: Receiver<Listing>,
+    queue: Arc<JobQueue>,
+    update_signal: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    complete: Arc<AtomicBool>,
+    progress_bits: Arc<AtomicU64>,
+    workers: usize,
+}
+
+impl Consumer {
+    fn run(self) {
+        let mut pending: usize = 1;
+        let mut progress = TopProgress::default();
+        let mut batch: Vec<Listing> = Vec::new();
+        let mut window_start = Instant::now();
+
+        while pending > 0 && !self.terminate.load(Ordering::SeqCst) {
+            let wait = BATCH_WINDOW.saturating_sub(window_start.elapsed());
+            match self.rx.recv_timeout(wait.max(Duration::from_millis(1))) {
+                Ok(listing) => batch.push(listing),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            while let Ok(listing) = self.rx.try_recv() {
+                batch.push(listing);
+            }
+            // apply early when workers are about to run out of jobs
+            let workers_starving = self.queue.len() < self.workers;
+            if batch.is_empty() || (!workers_starving && window_start.elapsed() < BATCH_WINDOW) {
+                continue;
+            }
+
+            let mut new_jobs = Vec::new();
+            {
+                let mut tree = self.tree.lock().unwrap();
+                if self.terminate.load(Ordering::SeqCst) {
+                    break;
+                }
+                for listing in batch.drain(..) {
+                    let created = apply_listing(&mut tree, listing, &mut new_jobs, &mut progress);
+                    pending = pending + created - 1;
+                }
+            }
+            self.queue.push_all(new_jobs);
+            self.progress_bits
+                .store(progress.fraction().to_bits(), Ordering::Relaxed);
+            self.update_signal.store(true, Ordering::SeqCst);
+            window_start = Instant::now();
+        }
+        self.complete.store(true, Ordering::SeqCst);
+        self.update_signal.store(true, Ordering::SeqCst);
+        self.terminate.store(true, Ordering::SeqCst);
+        self.queue.wake_all();
+    }
+}
+
+// returns the number of jobs created
+fn apply_listing(
+    tree: &mut Tree,
+    listing: Listing,
+    new_jobs: &mut Vec<Job>,
+    progress: &mut TopProgress,
+) -> usize {
+    let Listing {
+        job,
+        names,
+        entries,
+    } = listing;
+    let is_root = job.top == NO_TOP;
+    let mut offset = 0;
+    let mut total_size = 0;
+    let mut created = 0;
+    for entry in entries {
+        let end = offset + entry.name_len as usize;
+        // SAFETY: names holds whole as_encoded_bytes() outputs back to back and
+        // name_len is the exact length of one of them (or 0)
+        let name = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&names[offset..end]) };
+        offset = end;
+        let id = tree.add_child(job.node, name, entry.kind == Kind::File, entry.size);
+        total_size += entry.size;
+        if entry.kind == Kind::Dir {
+            let top = if is_root {
+                progress.add_folder()
+            } else {
+                progress.job_added(job.top);
+                job.top
+            };
+            new_jobs.push(Job {
+                node: id,
+                path: job.path.join(name),
+                top,
+            });
+            created += 1;
+        } else if is_root {
+            progress.add_finished();
+        }
+    }
+    tree.propagate_size(job.node, total_size);
+    if !is_root {
+        progress.job_finished(job.top);
+    }
+    created
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::thread;
-    use std::time::Duration;
-    use tempfile::tempdir;
+    use crate::squarify::compute_gui_nodes;
+    use crate::types::Rectangle;
+
+    // cargo test --release bench_scan -- --ignored --nocapture
+    // with SPACEMAN_BENCH_PATH set to the folder to scan
+    #[test]
+    #[ignore]
+    fn bench_scan() {
+        let path = std::env::var("SPACEMAN_BENCH_PATH").unwrap_or_else(|_| ".".into());
+        let start = Instant::now();
+        let scan = Scan::new(&path);
+        while !scan.complete.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let scan_time = start.elapsed();
+        let tree = scan.tree_mutex.lock().unwrap();
+        let bound = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let start = Instant::now();
+        let gui_nodes = compute_gui_nodes(&tree, 0, bound, 20.0);
+        let layout_time = start.elapsed();
+        println!(
+            "BENCH path={} nodes={} bytes={} scan={:?} layout={:?} boxes={} tree_heap_mb={:.1}",
+            path,
+            tree.len(),
+            tree.get_elem(0).size,
+            scan_time,
+            layout_time,
+            gui_nodes.len(),
+            tree.heap_bytes() as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn scan_matches_directory_contents() {
+        let dir = std::env::temp_dir().join(format!("spaceman-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("one.bin"), vec![0u8; 1000]).unwrap();
+        fs::write(dir.join("a/two.bin"), vec![0u8; 300]).unwrap();
+        fs::write(dir.join("a/b/three.bin"), vec![0u8; 20]).unwrap();
+        fs::write(dir.join("a/b/empty"), b"").unwrap();
+
+        let scan = Scan::new(dir.to_str().unwrap());
+        while !scan.complete.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        {
+            let tree = scan.tree_mutex.lock().unwrap();
+            // directories count their own metadata size on unix, so compare file bytes only
+            let mut file_bytes = 0;
+            let mut stack = vec![0];
+            let mut names = vec![];
+            while let Some(id) = stack.pop() {
+                let node = tree.get_elem(id);
+                if node.is_file {
+                    file_bytes += node.size;
+                    names.push(tree.path_of(id));
+                }
+                stack.extend(tree.children(id));
+            }
+            assert_eq!(file_bytes, 1320);
+            assert_eq!(tree.len(), 7);
+            assert!(names.contains(&dir.join("a").join("b").join("three.bin")));
+            assert_eq!(scan.progress(), 1.0);
+        }
+        drop(scan);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn invalidate_detaches_subtree() {
+        let mut tree = Tree::new("root");
+        let a = tree.add_child(0, "a".as_ref(), false, 0);
+        let f = tree.add_child(a, "f".as_ref(), true, 10);
+        tree.propagate_size(a, 10);
+        let g = tree.add_child(0, "g".as_ref(), true, 5);
+        tree.propagate_size(0, 5);
+        assert_eq!(tree.get_elem(0).size, 15);
+        tree.invalidate_elem(a);
+        assert_eq!(tree.get_elem(0).size, 5);
+        assert_eq!(tree.children(0).collect::<Vec<_>>(), vec![g]);
+        // late scan results for the removed folder must not reach the root
+        tree.propagate_size(f, 7);
+        assert_eq!(tree.get_elem(0).size, 5);
+    }
 
     /// Regression test for when we introduced time based updates.
     /// We ended up missing everything in small folders or the last few elements in a folder,
     /// as the scan completed before the first flush happened.
     #[test]
     fn test_trailing_elements_flushed() {
+        use std::fs::File;
         // create a temporary directory structure
-        let tmp_dir = tempdir().expect("Failed to create temp dir");
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root_path = tmp_dir.path();
 
         dbg!(root_path);
@@ -256,17 +508,12 @@ mod tests {
         // verify that the root node actually registered children
         let root_node = tree.get_elem(0);
         assert!(
-            !root_node.children.is_empty(),
+            root_node.has_children(),
             "Root node has no children registered"
         );
 
         // Ensure the total count of added nodes matches expected values
         // Expecting: Root node (0), "file1.txt", "small_folder", "file2.txt" -> 4 elements
-        assert_eq!(
-            tree.elems.len(),
-            4,
-            "Tree elements missing. Elements in tree: {:?}",
-            tree.elems
-        );
+        assert_eq!(tree.len(), 4, "Tree elements missing. Tree: {:?}", *tree);
     }
 }

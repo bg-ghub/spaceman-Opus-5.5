@@ -1,8 +1,16 @@
 use crate::{
     config::{MAX_VISIBLE_FS_DEPTH, MIN_BOX_SIZE},
-    types::{GUINode, Node, NodeID, Rectangle, Tree},
+    types::{GUINode, NodeID, Rectangle, Tree},
     utils::bytes_display,
 };
+
+// a child of the folder being laid out, or (node None) the sum of all
+// children too small to ever get a box of MIN_BOX_SIZE
+#[derive(Clone, Copy)]
+struct Item {
+    node: Option<NodeID>,
+    size: u64,
+}
 
 // wrapper function
 pub fn compute_gui_nodes(
@@ -11,150 +19,151 @@ pub fn compute_gui_nodes(
     bound: Rectangle,
     text_offset: f32,
 ) -> Vec<GUINode> {
-    let root = &tree.elems[root_id];
-    compute_gui_nodes_imp(tree, vec![root], bound, 0, text_offset)
-}
-
-fn compute_gui_nodes_imp(
-    tree: &Tree,
-    nodes: Vec<&Node>,
-    mut bound: Rectangle,
-    dir_level: usize,
-    text_offset: f32,
-) -> Vec<GUINode> {
-    if dir_level > MAX_VISIBLE_FS_DEPTH
-        || bound.width < MIN_BOX_SIZE
-        || bound.height < MIN_BOX_SIZE
-        || nodes.is_empty()
-    {
-        return vec![];
-    }
-
-    let mut gui_nodes: Vec<GUINode> = vec![];
-    // not a file, nor a directory
-    // we use this simple group of nodes for recursion
-    // without yielding any GUINodes
-    let node_group = nodes.len() > 1;
-
-    // if this is a directory or a file node
-    if !node_group {
-        let node = nodes.first().unwrap();
-
-        let gui_node = GUINode {
-            rect: bound.clone(),
-            node_id: node.id,
-            color: node.color(),
-            label: format!("{} ({})", node.name, bytes_display(node.size)),
-        };
-
-        gui_nodes.push(gui_node);
-
-        if !node.children.is_empty() {
-            // add padding for directory
-            bound = Rectangle {
-                x: bound.x + 3.0,
-                y: bound.y + text_offset,
-                width: bound.width - 6.0,
-                height: bound.height - text_offset - 3.0,
-            };
-        }
-    };
-
-    // if we have a directory or a node group, recurse
-    let (children, subdir_level, total_size) = if node_group {
-        let size = nodes.iter().fold(0, |acc, n| acc + n.size);
-        (nodes, 0, size)
-    } else {
-        let node = nodes.first().unwrap();
-        (
-            node.children.iter().map(|i| tree.get_elem(*i)).collect(),
-            1,
-            node.size,
-        )
-    };
-
-    if !children.is_empty() {
-        let (group_a, bound_a, group_b, bound_b) = squarify(children, bound, total_size);
-
-        // recurse
-        gui_nodes.extend(compute_gui_nodes_imp(
-            tree,
-            group_a,
-            bound_a,
-            dir_level + subdir_level,
-            text_offset,
-        ));
-        gui_nodes.extend(compute_gui_nodes_imp(
-            tree,
-            group_b,
-            bound_b,
-            dir_level + subdir_level,
-            text_offset,
-        ));
-    }
-
+    let mut gui_nodes = vec![];
+    layout_node(tree, root_id, bound, 0, text_offset, &mut gui_nodes);
     gui_nodes
 }
 
-fn squarify(
-    mut nodes: Vec<&Node>,
-    bound: Rectangle,
+fn too_small(bound: &Rectangle) -> bool {
+    bound.width < MIN_BOX_SIZE || bound.height < MIN_BOX_SIZE
+}
+
+fn layout_node(
+    tree: &Tree,
+    id: NodeID,
+    mut bound: Rectangle,
+    dir_level: usize,
+    text_offset: f32,
+    gui_nodes: &mut Vec<GUINode>,
+) {
+    if dir_level > MAX_VISIBLE_FS_DEPTH || too_small(&bound) {
+        return;
+    }
+    let node = tree.get_elem(id);
+    gui_nodes.push(GUINode {
+        rect: bound,
+        node_id: id,
+        color: node.color(),
+        label: format!("{} ({})", tree.name(id), bytes_display(node.size)),
+    });
+    if !node.has_children() {
+        return;
+    }
+
+    // add padding for directory
+    bound = Rectangle {
+        x: bound.x + 3.0,
+        y: bound.y + text_offset,
+        width: bound.width - 6.0,
+        height: bound.height - text_offset - 3.0,
+    };
+    if too_small(&bound) {
+        return;
+    }
+
+    let total_size: u64 = tree.children(id).map(|c| tree.get_elem(c).size).sum();
+    if total_size == 0 {
+        return;
+    }
+    // areas are exactly proportional to sizes, so anything below this size
+    // cannot reach MIN_BOX_SIZE in both dimensions and is merged into one item
+    let min_area = (MIN_BOX_SIZE * MIN_BOX_SIZE) as f64;
+    let area = (bound.width * bound.height) as f64;
+    let min_size = (total_size as f64 * min_area / area) as u64;
+
+    let mut items = vec![];
+    let mut rest = 0;
+    for child in tree.children(id) {
+        let size = tree.get_elem(child).size;
+        if size > 0 && size >= min_size {
+            items.push(Item {
+                node: Some(child),
+                size,
+            });
+        } else {
+            rest += size;
+        }
+    }
+    if rest > 0 {
+        items.push(Item { node: None, size: rest });
+    }
+    // sort once, splitting a sorted slice keeps both halves sorted
+    items.sort_unstable_by_key(|item| item.size);
+    layout_group(tree, &items, total_size, bound, dir_level + 1, text_offset, gui_nodes);
+}
+
+fn layout_group(
+    tree: &Tree,
+    items: &[Item],
     total_size: u64,
-) -> (Vec<&Node>, Rectangle, Vec<&Node>, Rectangle) {
-    // sort by size and split into halves
+    bound: Rectangle,
+    dir_level: usize,
+    text_offset: f32,
+    gui_nodes: &mut Vec<GUINode>,
+) {
+    if items.is_empty() || total_size == 0 || too_small(&bound) {
+        return;
+    }
+    if let [item] = items {
+        if let Some(id) = item.node {
+            layout_node(tree, id, bound, dir_level, text_offset, gui_nodes);
+        }
+        return;
+    }
 
-    nodes.sort_by_key(|x| x.size);
-
+    // split into halves by size, both sides keep at least one item
     let mut size_a = 0;
     let mut split = 0;
-    while size_a < total_size / 2 && split < nodes.len() {
-        size_a += nodes[split].size;
+    while split < items.len() - 1 && size_a < total_size / 2 {
+        size_a += items[split].size;
         split += 1;
     }
-    if split == nodes.len() {
-        split -= 1;
-        size_a -= nodes[split].size;
+    if split == 0 {
+        size_a = items[0].size;
+        split = 1;
     }
-
-    let mut vec_a = nodes;
-    let vec_b = vec_a.split_off(split);
+    let (group_a, group_b) = items.split_at(split);
+    let ratio = size_a as f32 / total_size as f32;
 
     // orientation
     let (bound_a, bound_b) = if bound.width > bound.height {
         // horizontal
-        let split_width = bound.width * (size_a as f32 / total_size as f32);
-
-        let bound_a = Rectangle {
-            x: bound.x,
-            y: bound.y,
-            width: split_width,
-            height: bound.height,
-        };
-        let bound_b = Rectangle {
-            x: bound.x + split_width,
-            y: bound.y,
-            width: bound.width - split_width,
-            height: bound.height,
-        };
-        (bound_a, bound_b)
+        let split_width = bound.width * ratio;
+        (
+            Rectangle {
+                width: split_width,
+                ..bound
+            },
+            Rectangle {
+                x: bound.x + split_width,
+                width: bound.width - split_width,
+                ..bound
+            },
+        )
     } else {
         // vertical
-        let split_height = bound.height * (size_a as f32 / total_size as f32);
-
-        let bound_a = Rectangle {
-            x: bound.x,
-            y: bound.y,
-            width: bound.width,
-            height: split_height,
-        };
-        let bound_b = Rectangle {
-            x: bound.x,
-            y: bound.y + split_height,
-            width: bound.width,
-            height: bound.height - split_height,
-        };
-        (bound_a, bound_b)
+        let split_height = bound.height * ratio;
+        (
+            Rectangle {
+                height: split_height,
+                ..bound
+            },
+            Rectangle {
+                y: bound.y + split_height,
+                height: bound.height - split_height,
+                ..bound
+            },
+        )
     };
 
-    (vec_a, bound_a, vec_b, bound_b)
+    layout_group(tree, group_a, size_a, bound_a, dir_level, text_offset, gui_nodes);
+    layout_group(
+        tree,
+        group_b,
+        total_size - size_a,
+        bound_b,
+        dir_level,
+        text_offset,
+        gui_nodes,
+    );
 }

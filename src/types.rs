@@ -1,4 +1,6 @@
 use crate::node_color;
+use std::borrow::Cow;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy)]
@@ -23,18 +25,21 @@ pub struct RGBA {
     pub a: f32,
 }
 
-pub type NodeID = usize;
+pub type NodeID = u32;
+pub const NO_NODE: NodeID = NodeID::MAX;
 
-#[derive(Debug, Default, Clone)]
+// 32 bytes per node: names live in a shared arena, full paths are rebuilt
+// from the parent chain on demand, children form an intrusive sibling list
+#[derive(Debug, Clone, Copy)]
 pub struct Node {
-    pub id: NodeID,
     pub size: u64,
-    pub name: String,
-    pub path: PathBuf,
-    pub depth: u64,
+    name_start: u32,
+    pub parent: NodeID,
+    pub first_child: NodeID,
+    pub next_sibling: NodeID,
+    name_len: u16,
+    pub depth: u16,
     pub is_file: bool,
-    pub parent: Option<NodeID>,
-    pub children: Vec<NodeID>,
 }
 
 impl Node {
@@ -44,90 +49,186 @@ impl Node {
             true => node_color::depth_file_color(self.depth as usize),
         }
     }
+    pub fn has_children(&self) -> bool {
+        self.first_child != NO_NODE
+    }
 }
 
 #[derive(Debug)]
 pub struct Tree {
-    // TODO: elems being public isn't desirable, implement iterator
-    // https://aloso.github.io/2021/03/09/creating-an-iterator
-    pub elems: Vec<Node>,
-    pub last_id: NodeID,
+    elems: Vec<Node>,
+    // OsStr encoded bytes of every node name, back to back
+    names: Vec<u8>,
 }
 
 impl Tree {
     pub fn new(root_name: &str) -> Tree {
-        Tree {
-            elems: vec![Node {
-                name: root_name.into(),
-                path: root_name.into(),
-                ..Default::default()
-            }],
-            last_id: 0,
-        }
+        let mut tree = Tree {
+            elems: Vec::new(),
+            names: Vec::new(),
+        };
+        let (name_start, name_len) = tree.push_name(OsStr::new(root_name));
+        tree.elems.push(Node {
+            size: 0,
+            name_start,
+            parent: NO_NODE,
+            first_child: NO_NODE,
+            next_sibling: NO_NODE,
+            name_len,
+            depth: 0,
+            is_file: false,
+        });
+        tree
     }
-    fn propagate_child_size(&mut self, mut node: NodeID, size: u64, negative: bool) {
-        while let Some(p) = self.elems[node].parent {
-            if negative {
-                self.elems[p].size -= size;
-            } else {
-                self.elems[p].size += size;
-            }
+    fn push_name(&mut self, name: &OsStr) -> (u32, u16) {
+        let bytes = name.as_encoded_bytes();
+        let start = self.names.len();
+        // real file systems cap names far below u16::MAX; anything that does not
+        // fit is stored as an empty name rather than truncated mid-character
+        if bytes.len() > u16::MAX as usize || start + bytes.len() > u32::MAX as usize {
+            return (0, 0);
+        }
+        self.names.extend_from_slice(bytes);
+        (start as u32, bytes.len() as u16)
+    }
+    pub fn os_name(&self, id: NodeID) -> &OsStr {
+        let node = &self.elems[id as usize];
+        let start = node.name_start as usize;
+        let bytes = &self.names[start..start + node.name_len as usize];
+        // SAFETY: every range stored in a node is either empty or exactly the
+        // bytes of one whole OsStr::as_encoded_bytes() call made in push_name
+        unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }
+    }
+    pub fn name(&self, id: NodeID) -> Cow<'_, str> {
+        self.os_name(id).to_string_lossy()
+    }
+    pub fn path_of(&self, id: NodeID) -> PathBuf {
+        let mut chain = vec![id];
+        let mut node = id;
+        while let Some(p) = self.parent_of(node) {
+            chain.push(p);
             node = p;
         }
+        let mut path = PathBuf::new();
+        for n in chain.into_iter().rev() {
+            path.push(self.os_name(n));
+        }
+        path
     }
-    pub fn add_elem(
-        &mut self,
-        parent: NodeID,
-        name: String,
-        path: PathBuf,
-        is_file: bool,
-        size: u64,
-    ) {
-        self.last_id += 1;
-        let node = Node {
-            id: self.last_id,
-            name,
-            path,
+    fn parent_of(&self, id: NodeID) -> Option<NodeID> {
+        let parent = self.elems[id as usize].parent;
+        (parent != NO_NODE).then_some(parent)
+    }
+    pub fn children(&self, id: NodeID) -> Children<'_> {
+        Children {
+            tree: self,
+            next: self.elems[id as usize].first_child,
+        }
+    }
+    // the size is not propagated to ancestors, call propagate_size once per batch
+    pub fn add_child(&mut self, parent: NodeID, name: &OsStr, is_file: bool, size: u64) -> NodeID {
+        let id = self.elems.len() as NodeID;
+        let (name_start, name_len) = self.push_name(name);
+        let parent_node = &mut self.elems[parent as usize];
+        let next_sibling = parent_node.first_child;
+        parent_node.first_child = id;
+        let depth = parent_node.depth.saturating_add(1);
+        self.elems.push(Node {
             size,
-            depth: self.elems[parent].depth + 1,
+            name_start,
+            parent,
+            first_child: NO_NODE,
+            next_sibling,
+            name_len,
+            depth,
             is_file,
-            parent: Some(parent),
-            children: vec![],
-        };
-        self.elems[parent].children.push(self.last_id);
-        self.elems.push(node);
-        self.propagate_child_size(self.last_id, size, false);
+        });
+        id
+    }
+    // adds size to node and all its ancestors
+    pub fn propagate_size(&mut self, mut node: NodeID, size: u64) {
+        if size == 0 {
+            return;
+        }
+        loop {
+            let elem = &mut self.elems[node as usize];
+            elem.size += size;
+            if elem.parent == NO_NODE {
+                break;
+            }
+            node = elem.parent;
+        }
     }
     pub fn invalidate_elem(&mut self, node: NodeID) {
-        let size = self.elems[node].size;
-        let parent_id = self.elems[node].parent;
-        if let Some(parent_id) = parent_id {
-            let parent = &mut self.elems[parent_id];
-            if let Some(pos) = parent.children.iter().position(|x| *x == node) {
-                parent.children.remove(pos);
+        let Some(parent) = self.parent_of(node) else {
+            return;
+        };
+        let size = self.elems[node as usize].size;
+        let next = self.elems[node as usize].next_sibling;
+        if self.elems[parent as usize].first_child == node {
+            self.elems[parent as usize].first_child = next;
+        } else {
+            let mut prev = self.elems[parent as usize].first_child;
+            while prev != NO_NODE {
+                if self.elems[prev as usize].next_sibling == node {
+                    self.elems[prev as usize].next_sibling = next;
+                    break;
+                }
+                prev = self.elems[prev as usize].next_sibling;
             }
         }
-        self.propagate_child_size(node, size, true);
+        let mut ancestor = parent;
+        loop {
+            let elem = &mut self.elems[ancestor as usize];
+            elem.size = elem.size.saturating_sub(size);
+            if elem.parent == NO_NODE {
+                break;
+            }
+            ancestor = elem.parent;
+        }
+        // detach it, so entries still arriving from the scan for this subtree
+        // no longer reach the ancestors' sizes
+        let elem = &mut self.elems[node as usize];
+        elem.parent = NO_NODE;
+        elem.next_sibling = NO_NODE;
     }
     pub fn get_elem(&self, id: NodeID) -> &Node {
-        &self.elems[id]
+        &self.elems[id as usize]
     }
-    /*fn truncate_tree(&mut self) {
-        self.elems.truncate(0);
-        self.last_id = 0;
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.elems.len()
     }
-    pub fn set_root(&mut self, root_name: &str) {
-        self.truncate_tree();
-        self.elems.push(Node {
-            name: root_name.into(),
-            ..Default::default()
-        });
-    }*/
+    #[cfg(test)]
+    pub fn heap_bytes(&self) -> usize {
+        self.elems.capacity() * std::mem::size_of::<Node>() + self.names.capacity()
+    }
+    pub fn clear(&mut self) {
+        self.elems = Vec::new();
+        self.names = Vec::new();
+    }
 }
 
 impl Default for Tree {
     fn default() -> Self {
         Tree::new("")
+    }
+}
+
+pub struct Children<'a> {
+    tree: &'a Tree,
+    next: NodeID,
+}
+
+impl Iterator for Children<'_> {
+    type Item = NodeID;
+    fn next(&mut self) -> Option<NodeID> {
+        if self.next == NO_NODE {
+            return None;
+        }
+        let id = self.next;
+        self.next = self.tree.elems[id as usize].next_sibling;
+        Some(id)
     }
 }
 

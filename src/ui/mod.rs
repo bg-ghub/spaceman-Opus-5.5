@@ -43,6 +43,9 @@ pub struct TreeMapState {}
 
 pub struct TreeMapProgram {
     pub rects_cache: canvas::Cache,
+    // the hover highlight is its own layer, so moving the mouse does not
+    // redraw every box and label
+    pub hover_cache: canvas::Cache,
     pub menu_cache: canvas::Cache,
     pub gui_nodes: Vec<GUINode>,
     pub bounds: iced::Rectangle,
@@ -151,13 +154,8 @@ impl Program<TreeMapMessage> for TreeMapProgram {
         let tree_geometry = self.rects_cache.draw(renderer, bounds.size(), |frame| {
             for gnode in self.gui_nodes.iter() {
                 let color_rgba = gnode.color;
-
-                let color = if self.active_node.is_some_and(|x| x == gnode.node_id) {
-                    Color::from_rgba(color_rgba.r, color_rgba.g, color_rgba.b, color_rgba.a)
-                        .mix(Color::WHITE, 0.1)
-                } else {
-                    Color::from_rgba(color_rgba.r, color_rgba.g, color_rgba.b, color_rgba.a)
-                };
+                let color =
+                    Color::from_rgba(color_rgba.r, color_rgba.g, color_rgba.b, color_rgba.a);
 
                 let rect_pos =
                     Point::new(gnode.rect.x + config::BORDER, gnode.rect.y + config::BORDER);
@@ -181,13 +179,29 @@ impl Program<TreeMapMessage> for TreeMapProgram {
             }
         });
 
+        let hover_geometry = self.hover_cache.draw(renderer, bounds.size(), |frame| {
+            let active = self
+                .active_node
+                .and_then(|id| self.gui_nodes.iter().find(|gnode| gnode.node_id == id));
+            if let Some(gnode) = active {
+                frame.fill_rectangle(
+                    Point::new(gnode.rect.x + config::BORDER, gnode.rect.y + config::BORDER),
+                    Size::new(
+                        gnode.rect.width - config::BORDER * 2.0,
+                        gnode.rect.height - config::BORDER * 2.0,
+                    ),
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.15),
+                );
+            }
+        });
+
         if let Some(menu) = &self.context_menu {
             let menu_geometry = self.menu_cache.draw(renderer, bounds.size(), |frame| {
                 menu.draw(frame, cursor.position_in(bounds));
             });
-            return vec![tree_geometry, menu_geometry];
+            return vec![tree_geometry, hover_geometry, menu_geometry];
         }
-        vec![tree_geometry]
+        vec![tree_geometry, hover_geometry]
     }
 }
 
@@ -208,6 +222,7 @@ impl TreeMapApp {
                 scan_progress: 0.0,
                 program: TreeMapProgram {
                     rects_cache: canvas::Cache::default(),
+                    hover_cache: canvas::Cache::default(),
                     menu_cache: canvas::Cache::default(),
                     gui_nodes: vec![],
                     bounds: iced::Rectangle {
@@ -287,7 +302,7 @@ impl TreeMapApp {
 
                 if let Some(scan) = &self.scan {
                     if let Ok(tree) = scan.tree_mutex.lock() {
-                        let shown_root = *self.shown_root_id_history.last().unwrap_or(&0_usize);
+                        let shown_root = *self.shown_root_id_history.last().unwrap_or(&0);
                         self.program
                             .gui_nodes
                             .append(&mut compute_gui_nodes(&tree, shown_root, base_rect, 20.0));
@@ -295,6 +310,7 @@ impl TreeMapApp {
                 }
                 self.program.active_node_is_stale = true;
                 self.program.rects_cache.clear();
+                self.program.hover_cache.clear();
             }
             TreeMapMessage::BoundsChanged(bounds) => {
                 self.program.bounds = bounds;
@@ -304,9 +320,11 @@ impl TreeMapApp {
             }
             TreeMapMessage::NodeHovered(node_id) => {
                 if self.node_pending_trash.is_none() {
+                    if self.program.active_node != node_id {
+                        self.program.hover_cache.clear();
+                    }
                     self.program.active_node = node_id;
                     self.program.active_node_is_stale = false;
-                    self.program.rects_cache.clear();
                 }
             }
             TreeMapMessage::NodeRightClicked { node_id, position } => {
@@ -361,8 +379,8 @@ impl TreeMapApp {
             TreeMapMessage::FocusOnActiveNode => {
                 // don't focus on the same node again
                 if self.node_pending_trash.is_none()
-                    && *self.shown_root_id_history.last().unwrap_or(&0_usize)
-                        != self.program.active_node.unwrap_or(0_usize)
+                    && *self.shown_root_id_history.last().unwrap_or(&0)
+                        != self.program.active_node.unwrap_or(0)
                 {
                     if let Some(id) = self.program.active_node
                         && let Some(scan) = &self.scan
@@ -370,9 +388,9 @@ impl TreeMapApp {
                     {
                         let node = tree.get_elem(id);
                         if !node.is_file {
-                            self.shown_root_id_history.push(node.id);
+                            self.shown_root_id_history.push(id);
                             self.shown_root_path_history
-                                .push(node.path.to_string_lossy().into());
+                                .push(tree.path_of(id).to_string_lossy().into());
                             return Task::done(TreeMapMessage::RecalculateRects);
                         }
                     }
